@@ -1,5 +1,7 @@
 package refresh.database;
 
+import refresh.database.models.WorkerInfo;
+
 import java.sql.*;
 import java.time.LocalDateTime;
 import java.time.OffsetDateTime;
@@ -51,6 +53,37 @@ public class GameDatabaseContext implements AutoCloseable {
                 }
             }
         }
+    }
+
+    public WorkerInfo getWorker(int id) throws SQLException {
+        String sql = "SELECT \"WorkerId\", \"Class\", \"CreatedAt\", \"LastContact\" FROM \"Workers\" WHERE \"WorkerId\" = ?";
+        try(PreparedStatement stmt = conn.prepareStatement(sql)) {
+            stmt.setInt(1, id);
+
+            try(ResultSet rs = stmt.executeQuery()) {
+                if(rs.next()) return new WorkerInfo(rs);
+                return null;
+            }
+        }
+    }
+
+    public boolean markWorkerContacted(int id) throws SQLException {
+        WorkerInfo worker = getWorker(id);
+        if(worker == null)
+            return false;
+
+        String sql = "UPDATE \"Workers\" SET \"LastContact\" = ? WHERE \"WorkerId\" = ?";
+
+        try(PreparedStatement stmt = conn.prepareStatement(sql)) {
+            stmt.setTimestamp(1, Timestamp.valueOf(LocalDateTime.now()));
+            stmt.setInt(2, id);
+
+            int updated = stmt.executeUpdate();
+            if(updated != 1)
+                throw new SQLException("Expected to update 1 row, but only updated " + updated);
+        }
+
+        return true;
     }
 
     @Override
