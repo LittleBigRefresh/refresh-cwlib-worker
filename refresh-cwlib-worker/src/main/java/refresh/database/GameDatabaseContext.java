@@ -1,10 +1,10 @@
 package refresh.database;
 
+import refresh.database.models.PersistentJobState;
 import refresh.database.models.WorkerInfo;
 
 import java.sql.*;
 import java.time.LocalDateTime;
-import java.time.OffsetDateTime;
 
 public class GameDatabaseContext implements AutoCloseable {
     private final Connection conn;
@@ -84,6 +84,18 @@ public class GameDatabaseContext implements AutoCloseable {
         }
 
         return true;
+    }
+
+    public PersistentJobState getJobState(String jobId) throws SQLException {
+        String sql = "SELECT \"JobId\", \"Class\", \"State\" FROM \"JobStates\" WHERE \"JobId\" = ? AND \"Class\" = 1";
+        try(PreparedStatement stmt = conn.prepareStatement(sql)) {
+            stmt.setString(1, jobId);
+
+            try(ResultSet rs = stmt.executeQuery()) {
+                if(rs.next()) return new PersistentJobState(rs);
+                return null;
+            }
+        }
     }
 
     @Override
