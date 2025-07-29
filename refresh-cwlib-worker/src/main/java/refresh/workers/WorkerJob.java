@@ -2,7 +2,7 @@ package refresh.workers;
 
 public abstract class WorkerJob {
     public final String getJobId() {
-        return this.getClass().getName();
+        return this.getClass().getSimpleName();
     }
 
     protected abstract Class<?> getJobStateType();
@@ -15,5 +15,5 @@ public abstract class WorkerJob {
         this.jobState = jobState;
     }
 
-    public abstract void executeJob(WorkContext context);
+    public abstract void executeJob(WorkContext context) throws Exception;
 }
