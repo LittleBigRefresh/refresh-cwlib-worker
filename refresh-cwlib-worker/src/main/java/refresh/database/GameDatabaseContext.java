@@ -2,9 +2,15 @@ package refresh.database;
 
 import refresh.database.models.PersistentJobState;
 import refresh.database.models.WorkerInfo;
+import refresh.helpers.CommonConstants;
+import refresh.resources.MinimalLevelData;
+import refresh.resources.MinimalPlanData;
+import refresh.resources.MinimalResource;
 
 import java.sql.*;
 import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.HashSet;
 
 public class GameDatabaseContext implements AutoCloseable {
     private final Connection conn;
@@ -20,6 +26,139 @@ public class GameDatabaseContext implements AutoCloseable {
     public GameDatabaseContext() throws SQLException {
         String url = "jdbc:postgresql://localhost/refresh";
         this.conn = DriverManager.getConnection(url, "refresh", "refresh");
+    }
+
+    /**
+     * Returns the hashes of all level root or photo plan assets we want to scan.
+     * If a GameAsset's ScannedByCWLibVersion is 0, it hasn't been scanned yet, and if it's above that but below our current version,
+     * its scan is outdated; the asset should be scanned again in both cases.
+     * Excludes PSP assets since we still can't parse them.
+     */
+    // TODO consider whether we should also clear data for assets no longer used by any levels or photos
+    public HashSet<String> getAssetHashesNeedingScans() throws SQLException {
+        String sql = 
+                """
+                SELECT concatenated."AssetHash" FROM (
+                    SELECT a."AssetHash", a."ScannedByCWLibVersion", a."IsPSP", l."UpdateDate" AS LastUsedAt
+                    FROM "GameAssets" AS a
+                    INNER JOIN "GameLevels" l
+                    ON a."AssetHash" = l."RootResource"
+
+                    UNION
+
+                    SELECT a."AssetHash", a."ScannedByCWLibVersion", a."IsPSP", p."PublishedAt" AS LastUsedAt
+                    FROM "GameAssets" AS a
+                    INNER JOIN "GamePhotos" p
+                    ON a."AssetHash" = p."PlanHash"
+                ) AS concatenated
+                WHERE concatenated."ScannedByCWLibVersion" < ? AND NOT concatenated."IsPSP"
+                ORDER BY concatenated.LastUsedAt DESC
+                LIMIT 100
+                """;
+                // No need to do any skipping, asset hashes fetched here will be set as scanned later by ScanNewAssetsJob.
+                // Also, 100 is enough per cycle, since we will also traverse and scan dependencies for all of them.
+
+        HashSet<String> hashes = new HashSet<>();
+        try(PreparedStatement stmt = conn.prepareStatement(sql)) {
+            stmt.setInt(1, CommonConstants.CurrentCWLibWorkerVersion);
+
+            try(ResultSet rs = stmt.executeQuery()) {
+                while (rs.next()) {
+                    hashes.add(rs.getString(1));
+                }
+            }
+        }
+        return hashes;
+    }
+    
+    public void addOrUpdatePlanData(MinimalResource<MinimalPlanData> plan) throws SQLException {
+        // Remove old data (potentially from a previous scan)
+        String removePlanSql = "DELETE FROM \"GamePlanAssets\" WHERE \"PlanHash\" = ?";
+        try(PreparedStatement stmt = conn.prepareStatement(removePlanSql)) {
+            stmt.setString(1, plan.Hash);
+            stmt.executeUpdate(removePlanSql);
+        }
+
+        // Delete old plan data so we can replace it with new one, and mark this asset as scanned (if it has a GameAsset).
+        String sql = 
+                """
+                DELETE FROM "GamePlanAssets" WHERE "PlanHash" = ?";
+
+                INSERT INTO "GamePlanAssets" ("PlanHash", "Name", "Description", "IconHash")
+                VALUES (?, ?, ?, ?);
+
+                UPDATE "GameAssets" SET "ScannedByCWLibVersion" = ? WHERE "AssetHash" = ?;
+                """;
+
+        try(PreparedStatement stmt = conn.prepareStatement(sql)) {
+            stmt.setString(1, plan.Hash);
+
+            stmt.setString(2, plan.Hash);
+            stmt.setString(3, plan.Content.Name);
+            stmt.setString(4, plan.Content.Description);
+            stmt.setString(5, plan.Content.Icon);
+
+            stmt.setInt(6, CommonConstants.CurrentCWLibWorkerVersion);
+            stmt.setString(7, plan.Hash);
+
+            stmt.executeQuery();
+        }
+
+        // Update contributor names separately since they're stored in their own table.
+        this.addOrUpdateContributorNames(plan.Hash, plan.Content.ContributorUsernames);
+    }
+
+    public void addOrUpdateLevelData(MinimalResource<MinimalLevelData> level) throws SQLException {
+        // Delete old level data so we can replace it with new one, and mark this asset as scanned (if it has a GameAsset).
+        String insertPlanSql = 
+                """
+                DELETE FROM \"GameLevelAssets\" WHERE \"LevelHash\" = ?;
+
+                INSERT INTO "GameLevelAssets" ("LevelHash", "HasValidWorldThing")
+                VALUES (?, ?);
+
+                UPDATE "GameAssets" SET "ScannedByCWLibVersion" = ? WHERE "AssetHash" = ?;
+                """;
+
+        try(PreparedStatement stmt = conn.prepareStatement(insertPlanSql)) {
+            stmt.setString(1, level.Hash);
+
+            stmt.setString(2, level.Hash);
+            stmt.setBoolean(3, level.Content.HasValidWorldThing);
+
+            stmt.setInt(4, CommonConstants.CurrentCWLibWorkerVersion);
+            stmt.setString(5, level.Hash);
+
+            stmt.executeQuery();
+        }
+
+        // Update contributor names separately since the're stored in their own table.
+        this.addOrUpdateContributorNames(level.Hash, level.Content.ContributorUsernames);
+    }
+
+    private void addOrUpdateContributorNames(String assetHash, ArrayList<String> usernames) throws SQLException {
+        // Don't do anything if there aren't actually any usernames
+        if (usernames.size() <= 0) return;
+
+        int index = 0;
+        ArrayList<String> valueSqlParts = new ArrayList<>();
+        for (String username : usernames) {
+            valueSqlParts.add(String.format("(%s, %s, %d)", assetHash, username, index));
+            index++;
+        }
+
+        // Clear previously saved usernames if there are any, and then append insertions for every username,
+        // which we've built in the loop above.
+        String sql = String.format(
+            """
+                DELETE FROM \"AssetContributorRelations\" WHERE \"AssetHash\" = %s;
+                INSERT INTO \"AssetContributorRelations\" (\"AssetHash\", \"Username\", \"Index\")
+                VALUES %s;
+             """, assetHash, String.join(",\n", valueSqlParts));
+        
+        try(Statement stmt = conn.createStatement()) {
+            stmt.executeUpdate(sql);
+        }
     }
 
     private void deleteWorkers() throws SQLException {
